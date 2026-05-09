@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""claude-tabs — snapshot, list, and restore Claude Code CLI sessions.
+
+Browser-style "restore my tabs" for Claude Code: capture every running
+`claude` you have open across terminal tabs, then re-launch them later
+with `claude --resume <session-id>`.
+
+Three commands:
+    claude-tabs save        snapshot live sessions to JSONL
+    claude-tabs list        pretty-print a snapshot
+    claude-tabs restore     re-open snapshot rows in new terminal tabs
+
+Pure stdlib. macOS today (Linux/Windows via --print or tmux).
+https://github.com/surendranb/claude-tabs
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+# ---- Constants -------------------------------------------------------------
+
+STATE_DIR    = Path.home() / ".claude" / "saved-sessions"
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+SCHEMA       = 1
+TRUNC        = 240
+ROADMAP_URL  = "https://github.com/surendranb/claude-tabs"
+UUID_RE      = re.compile(r"(?:^|\s)(?:-r|--resume)[\s=]?([0-9a-fA-F-]{36})")
+UUID_EXACT   = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+
+def _is_uuid(s: str) -> bool:
+    """True iff s is exactly a v4-shaped UUID — used to refuse tampered jsonl filenames."""
+    return bool(s) and bool(UUID_EXACT.match(s))
+
+
+class PlatformNotSupportedError(RuntimeError):
+    pass
+
+
+# ---- Platform seam ---------------------------------------------------------
+
+def _find_processes() -> list[dict]:
+    """Return [{pid, cwd, argv, start}] for live `claude` CLI processes."""
+    if sys.platform != "darwin":
+        raise PlatformNotSupportedError(
+            "claude-tabs save is macOS-only today. "
+            f"Linux/Windows: {ROADMAP_URL}"
+        )
+    procs: list[dict] = []
+    for line in _run(["ps", "-axo", "pid,command"]).splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2 or parts[1] != "claude":
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        cwd = _macos_cwd(pid)
+        if not cwd:
+            continue
+        argv = _run(["ps", "-p", str(pid), "-o", "command="]).strip()
+        start = _macos_start_epoch(pid)
+        if start is None:
+            continue
+        procs.append({"pid": pid, "cwd": cwd, "argv": argv, "start": start})
+    return procs
+
+
+def _macos_cwd(pid: int) -> str | None:
+    for line in _run(["lsof", "-p", str(pid), "-a", "-d", "cwd", "-Fn"]).splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return None
+
+
+def _macos_start_epoch(pid: int) -> float | None:
+    s = _run(["ps", "-p", str(pid), "-o", "lstart="]).strip()
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%a %b %d %H:%M:%S %Y").timestamp()
+    except ValueError:
+        return None
+
+
+def _open_session(cwd: str, sid: str, target: str, mode: str) -> str:
+    """Open a session. Returns 'tab', 'window', or 'window-fallback'.
+
+    'window-fallback' means we tried for a tab in Terminal.app but System
+    Events Accessibility isn't granted, so we silently used a new window
+    instead of overwriting the calling tab.
+    """
+    if not _is_uuid(sid):
+        raise ValueError(f"refusing to open session with non-UUID id: {sid!r}")
+    if target == "tmux":
+        subprocess.run(
+            ["tmux", "new-window", "-c", cwd, f"claude --resume {sid}"],
+            check=True,
+        )
+        return "tab"
+    if target in ("terminal", "iterm"):
+        if sys.platform != "darwin":
+            raise PlatformNotSupportedError(
+                "AppleScript targets are macOS-only. Use --target tmux or --print."
+            )
+        result = subprocess.run(
+            ["osascript", "-", cwd, sid],
+            input=_APPLESCRIPTS[(target, mode)],
+            text=True, capture_output=True, check=True,
+        )
+        return (result.stdout.strip() or mode)
+    raise ValueError(f"unknown target: {target}")
+
+
+def _auto_target() -> str:
+    """Pick the right opener based on environment."""
+    if os.environ.get("TMUX"):
+        return "tmux"
+    tp = os.environ.get("TERM_PROGRAM")
+    if tp == "iTerm.app":
+        return "iterm"
+    if tp == "Apple_Terminal":
+        return "terminal"
+    if sys.platform == "darwin":
+        if Path("/Applications/iTerm.app").is_dir():
+            return "iterm"
+        return "terminal"
+    return "print"
+
+
+_APPLESCRIPTS = {
+    ("iterm", "tab"): """\
+on run argv
+  set theCwd to item 1 of argv
+  set theSid to item 2 of argv
+  set cmd to "cd " & quoted form of theCwd & " && claude --resume " & theSid
+  tell application "iTerm"
+    activate
+    if (count of windows) is 0 then
+      create window with default profile
+    end if
+    tell current window
+      create tab with default profile
+      tell current session to write text cmd
+    end tell
+  end tell
+end run
+""",
+    ("iterm", "window"): """\
+on run argv
+  set theCwd to item 1 of argv
+  set theSid to item 2 of argv
+  set cmd to "cd " & quoted form of theCwd & " && claude --resume " & theSid
+  tell application "iTerm"
+    activate
+    set w to (create window with default profile)
+    tell current session of w to write text cmd
+  end tell
+end run
+""",
+    ("terminal", "tab"): """\
+on run argv
+  set theCwd to item 1 of argv
+  set theSid to item 2 of argv
+  set cmd to "cd " & quoted form of theCwd & " && claude --resume " & theSid
+  tell application "Terminal" to activate
+  delay 0.1
+  set wasOpen to ((count of windows) > 0)
+  set tabsBefore to 0
+  if wasOpen then set tabsBefore to count of tabs of front window
+  set kbErr to false
+  try
+    tell application "System Events"
+      tell process "Terminal"
+        keystroke "t" using command down
+      end tell
+    end tell
+    delay 0.4
+  on error
+    set kbErr to true
+  end try
+  set newTabOk to false
+  if not kbErr and ((count of windows) > 0) then
+    if (count of tabs of front window) > tabsBefore then set newTabOk to true
+  end if
+  if newTabOk then
+    tell application "Terminal" to do script cmd in selected tab of front window
+    return "tab"
+  else
+    tell application "Terminal" to do script cmd
+    return "window-fallback"
+  end if
+end run
+""",
+    ("terminal", "window"): """\
+on run argv
+  set theCwd to item 1 of argv
+  set theSid to item 2 of argv
+  set cmd to "cd " & quoted form of theCwd & " && claude --resume " & theSid
+  tell application "Terminal"
+    activate
+    do script cmd
+  end tell
+end run
+""",
+}
+
+
+# ---- Pure logic ------------------------------------------------------------
+
+def _run(cmd: list[str]) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True).stdout
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return ""
+
+
+def _encode_cwd(cwd: str) -> str:
+    return cwd.replace("/", "-")
+
+
+def _parse_iso(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _first_entry_timestamp(jsonl: Path) -> float | None:
+    """Earliest `timestamp` field found in the jsonl, as epoch seconds."""
+    try:
+        with jsonl.open(encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                try:
+                    obj = json.loads(ln)
+                except json.JSONDecodeError:
+                    continue
+                dt = _parse_iso(obj.get("timestamp"))
+                if dt:
+                    return dt.timestamp()
+    except OSError:
+        pass
+    return None
+
+
+def _resolve_session_id(proc: dict) -> tuple[str | None, bool]:
+    """Return (session_id, was_resumed) for a claude process.
+
+    Only ever returns a string that passes `_is_uuid` — defence-in-depth
+    against tampered filenames in ~/.claude/projects/.
+    """
+    m = UUID_RE.search(proc["argv"])
+    if m and _is_uuid(m.group(1)):
+        return m.group(1), True
+    proj = PROJECTS_DIR / _encode_cwd(proc["cwd"])
+    if not proj.is_dir():
+        return None, False
+    best, best_diff = None, None
+    for f in proj.glob("*.jsonl"):
+        if not _is_uuid(f.stem):
+            continue
+        ts = _first_entry_timestamp(f)
+        if ts is None:
+            ts = f.stat().st_mtime
+        diff = abs(ts - proc["start"])
+        if best_diff is None or diff < best_diff:
+            best, best_diff = f, diff
+    return (best.stem, False) if best else (None, False)
+
+
+def _truncate(s: str, n: int = TRUNC) -> str:
+    s = " ".join((s or "").split())
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
+def _extract_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                return p.get("text") or ""
+    return ""
+
+
+def _is_real_user_prompt(obj: dict) -> bool:
+    if obj.get("type") != "user":
+        return False
+    msg = obj.get("message") or {}
+    content = msg.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        if any(isinstance(p, dict) and p.get("type") == "tool_result" for p in content):
+            return False
+        return any(
+            isinstance(p, dict) and p.get("type") == "text" and (p.get("text") or "").strip()
+            for p in content
+        )
+    return False
+
+
+def _humanize_relative(iso: str | None) -> str:
+    dt = _parse_iso(iso)
+    if not dt:
+        return "?"
+    now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+    s = (now - dt).total_seconds()
+    if s < 0:     return "just now"
+    if s < 60:    return f"{int(s)}s ago"
+    if s < 3600:  return f"{int(s / 60)}m ago"
+    if s < 86400: return f"{int(s / 3600)}h ago"
+    return f"{int(s / 86400)}d ago"
+
+
+def _humanize_duration(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:    return f"{s}s"
+    if s < 3600:  return f"{s // 60}m"
+    if s < 86400: return f"{s // 3600}h {(s % 3600) // 60}m"
+    return f"{s // 86400}d {(s % 86400) // 3600}h"
+
+
+def _parse_session(jsonl: Path) -> dict:
+    """Extract title / last prompt / turns / branch / model / etc. from a jsonl."""
+    first_p = last_p = None
+    first_ts = last_ts = None
+    branch = model = perm = None
+    turns = 0
+    with jsonl.open(encoding="utf-8", errors="replace") as f:
+        for ln in f:
+            try:
+                obj = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
+            if (ts := obj.get("timestamp")):
+                first_ts = first_ts or ts
+                last_ts = ts
+            if (b := obj.get("gitBranch")):
+                branch = b
+            if (p := obj.get("permissionMode")):
+                perm = p
+            if obj.get("type") == "assistant":
+                if (m := (obj.get("message") or {}).get("model")):
+                    model = m
+            if _is_real_user_prompt(obj):
+                txt = _extract_text((obj.get("message") or {}).get("content"))
+                if txt.strip():
+                    if first_p is None:
+                        first_p = txt
+                    last_p = txt
+                    turns += 1
+
+    st = jsonl.stat()
+    last_active = last_ts or datetime.fromtimestamp(st.st_mtime).astimezone().isoformat(timespec="seconds")
+    started     = first_ts or last_active
+    f_dt, l_dt  = _parse_iso(first_ts), _parse_iso(last_active)
+    duration    = _humanize_duration((l_dt - f_dt).total_seconds()) if f_dt and l_dt else None
+
+    return {
+        "started_at":      started,
+        "last_active":     last_active,
+        "duration":        duration,
+        "turns":           turns,
+        "title":           _truncate(first_p) if first_p else None,
+        "last_prompt":     _truncate(last_p)  if last_p  else None,
+        "git_branch":      branch,
+        "model":           model,
+        "permission_mode": perm,
+        "size_bytes":      st.st_size,
+    }
+
+
+def _load_snapshot(path: Path) -> list[dict]:
+    if not path.exists():
+        sys.exit(f"snapshot not found: {path}\nrun: claude-tabs save")
+    out = []
+    with path.open(encoding="utf-8") as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            try:
+                out.append(json.loads(ln))
+            except json.JSONDecodeError:
+                pass
+    return out
+
+
+def _filter_records(records: list[dict], picks: list[str]) -> list[dict]:
+    """picks may be 1-based indices or session-id prefixes."""
+    chosen, seen = [], set()
+    for p in picks:
+        match = None
+        if p.isdigit():
+            i = int(p) - 1
+            if 0 <= i < len(records):
+                match = records[i]
+        if match is None:
+            for r in records:
+                if r.get("session_id", "").startswith(p):
+                    match = r
+                    break
+        if match is None:
+            print(f"  no match for {p!r}", file=sys.stderr)
+            continue
+        key = (match["cwd"], match["session_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        chosen.append(match)
+    return chosen
+
+
+def _interactive_pick(records: list[dict]) -> list[dict]:
+    if not records:
+        return []
+    print(f"{len(records)} session(s) — enter indices (e.g. '1 3 5'),")
+    print("'all' for everything, or empty to cancel.\n")
+    for i, r in enumerate(records, 1):
+        title = (r.get("title") or "(no prompt yet)")[:90]
+        bits  = [f"{r.get('turns', 0)} turns"]
+        if r.get("git_branch"):
+            bits.append(r["git_branch"])
+        print(f"  [{i:>2}] {r['cwd']}  ({'  •  '.join(bits)})")
+        print(f"        {title}")
+    print()
+    sel = input("> ").strip()
+    if not sel:
+        return []
+    if sel.lower() == "all":
+        return records
+    return _filter_records(records, sel.split())
+
+
+def _print_records(records: list[dict], full: bool, as_json: bool) -> None:
+    if as_json:
+        for r in records:
+            print(json.dumps(r, ensure_ascii=False))
+        return
+    for i, r in enumerate(records, 1):
+        sid    = r.get("session_id", "?")
+        cwd    = r.get("cwd", "?")
+        turns  = r.get("turns", 0)
+        title  = r.get("title") or "(no prompt yet)"
+        last_p = r.get("last_prompt") or ""
+        meta   = [f"{sid[:8]}…", f"{turns} turns",
+                  f"started {_humanize_relative(r.get('started_at'))}",
+                  f"last {_humanize_relative(r.get('last_active'))}"]
+        if r.get("duration"):   meta.append(f"~{r['duration']}")
+        if r.get("git_branch"): meta.append(f"branch: {r['git_branch']}")
+        if r.get("model"):      meta.append(r["model"])
+        if r.get("resumed"):    meta.append("resumed")
+        print(f"[{i}] {cwd}")
+        print("    " + "  •  ".join(meta))
+        print(f"    Title: {title}")
+        if last_p and last_p != title:
+            print(f"    Last:  {last_p}")
+        if full:
+            shown = {"_schema", "cwd", "session_id", "title", "last_prompt", "turns",
+                     "git_branch", "model", "last_active", "started_at", "duration",
+                     "resumed"}
+            for k, v in r.items():
+                if k in shown:
+                    continue
+                print(f"    {k}: {v}")
+        print()
+
+
+# ---- Subcommands -----------------------------------------------------------
+
+def cmd_save(args: argparse.Namespace) -> int:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    out = STATE_DIR / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}.jsonl"
+
+    try:
+        procs = _find_processes()
+    except PlatformNotSupportedError as e:
+        sys.exit(str(e))
+
+    if not procs:
+        if not args.quiet:
+            print("No 'claude' CLI processes found.")
+        return 0
+
+    records, seen = [], set()
+    for p in procs:
+        sid, resumed = _resolve_session_id(p)
+        if not sid:
+            if not args.quiet:
+                print(f"  skipped pid {p['pid']} ({p['cwd']}): no session id",
+                      file=sys.stderr)
+            continue
+        key = (p["cwd"], sid)
+        if key in seen:
+            continue
+        seen.add(key)
+        jsonl = PROJECTS_DIR / _encode_cwd(p["cwd"]) / f"{sid}.jsonl"
+        meta  = _parse_session(jsonl) if jsonl.exists() else {}
+        records.append({
+            "_schema":    SCHEMA,
+            "cwd":        p["cwd"],
+            "session_id": sid,
+            "pid":        p["pid"],
+            "resumed":    resumed,
+            **meta,
+        })
+
+    with out.open("w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.chmod(out, 0o600)  # snapshot can carry prompt previews; user-only read/write
+
+    latest = STATE_DIR / "latest.jsonl"
+    if latest.is_symlink() or latest.exists():
+        latest.unlink()
+    latest.symlink_to(out.name)
+
+    if args.quiet:
+        return 0
+    print(f"Saved {len(records)} session(s) → {out}\n")
+    for i, r in enumerate(records, 1):
+        title = r.get("title") or "(no prompt yet)"
+        bits  = [f"{r.get('turns', 0)} turns"]
+        if r.get("duration"):   bits.append(f"~{r['duration']}")
+        if r.get("git_branch"): bits.append(r["git_branch"])
+        print(f"  [{i}] {r['cwd']}")
+        print(f"      {r['session_id'][:8]}…  •  " + "  •  ".join(bits))
+        print(f"      {title[:100]}")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    if args.all:
+        files = sorted(
+            (p for p in STATE_DIR.glob("*.jsonl") if p.name != "latest.jsonl"),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+        if not files:
+            sys.exit(f"no snapshots in {STATE_DIR}")
+        for f in files:
+            print(f"═══ {f.name} ═══\n")
+            _print_records(_load_snapshot(f), args.full, args.json)
+        return 0
+
+    path    = Path(args.file) if args.file else STATE_DIR / "latest.jsonl"
+    records = _load_snapshot(path)
+    if args.json:
+        for r in records:
+            print(json.dumps(r, ensure_ascii=False))
+        return 0
+    target = path.resolve() if path.is_symlink() else path
+    print(f"═══ {target.name} — {len(records)} session(s) ═══\n")
+    _print_records(records, args.full, False)
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    path    = Path(args.file) if args.file else STATE_DIR / "latest.jsonl"
+    records = _load_snapshot(path)
+
+    if args.interactive:
+        records = _interactive_pick(records)
+    elif args.picks:
+        records = _filter_records(records, args.picks)
+
+    if not records:
+        print("nothing to restore.")
+        return 0
+
+    if args.print_only:
+        target = "print"
+    elif args.target:
+        target = args.target
+    else:
+        target = _auto_target()
+
+    mode = "window" if args.windows else "tab"
+
+    warned_fallback = False
+    for r in records:
+        cwd, sid = r["cwd"], r["session_id"]
+        if not _is_uuid(sid):
+            print(f"  skipped: {sid!r} is not a valid session id", file=sys.stderr)
+            continue
+        if target == "print":
+            print(f"cd {shlex.quote(cwd)} && claude --resume {sid}")
+        else:
+            print(f"→ {cwd}  ({sid[:8]}…)", file=sys.stderr)
+            try:
+                outcome = _open_session(cwd, sid, target, mode)
+            except PlatformNotSupportedError as e:
+                sys.exit(str(e))
+            if outcome == "window-fallback" and not warned_fallback:
+                print(
+                    "\n  Terminal.app fell back to new windows because System "
+                    "Events Accessibility isn't granted.\n"
+                    "  For tabs, allow it in: System Settings → Privacy & Security "
+                    "→ Accessibility (toggle on for Terminal).\n",
+                    file=sys.stderr,
+                )
+                warned_fallback = True
+            time.sleep(0.5)
+
+    if target != "print":
+        n = len(records)
+        m = mode + ("s" if n != 1 else "")
+        print(f"\nopened {n} {m} via {target}.", file=sys.stderr)
+    return 0
+
+
+# ---- Argparse --------------------------------------------------------------
+
+def _build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="claude-tabs",
+        description="Snapshot, list, and restore Claude Code CLI sessions.",
+        epilog="Run 'claude-tabs <command> --help' for command-specific options.",
+    )
+    sub = ap.add_subparsers(dest="cmd", metavar="<command>")
+
+    p = sub.add_parser("save", help="snapshot live `claude` sessions to JSONL")
+    p.add_argument("-q", "--quiet", action="store_true", help="suppress non-error output")
+    p.set_defaults(func=cmd_save)
+
+    p = sub.add_parser("list", help="show what's in a saved snapshot")
+    p.add_argument("file", nargs="?", help="snapshot path (default: latest.jsonl)")
+    p.add_argument("-a", "--all",  action="store_true", help="list every snapshot in state dir")
+    p.add_argument("-f", "--full", action="store_true", help="show every captured field")
+    p.add_argument("--json", action="store_true", help="emit raw JSONL (for piping)")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("restore", help="re-open snapshot rows in new terminal tabs")
+    p.add_argument("picks", nargs="*", help="1-based indices or session-id prefixes (default: all)")
+    p.add_argument("-f", "--file",        help="snapshot path (default: latest.jsonl)")
+    p.add_argument("-w", "--windows",     action="store_true", help="open as new windows, not tabs")
+    p.add_argument("-i", "--interactive", action="store_true", help="prompt to pick sessions")
+    p.add_argument("-p", "--print", dest="print_only", action="store_true",
+                   help="print shell commands; pipe to sh to execute")
+    p.add_argument("-t", "--target", choices=["terminal", "iterm", "tmux", "print"],
+                   help="explicit opener (default: auto-detect)")
+    p.set_defaults(func=cmd_restore)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap   = _build_parser()
+    args = ap.parse_args(argv)
+
+    # Bare invocation → list latest snapshot if it exists, else show help.
+    if not args.cmd:
+        latest = STATE_DIR / "latest.jsonl"
+        if latest.exists():
+            return cmd_list(argparse.Namespace(
+                file=None, all=False, full=False, json=False,
+            ))
+        ap.print_help()
+        return 0
+
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
