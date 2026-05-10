@@ -112,12 +112,17 @@ def _open_session(cwd: str, sid: str, target: str, mode: str) -> str:
             raise PlatformNotSupportedError(
                 "AppleScript targets are macOS-only. Use --target tmux or --print."
             )
-        result = subprocess.run(
-            ["osascript", "-", cwd, sid],
-            input=_APPLESCRIPTS[(target, mode)],
-            text=True, capture_output=True, check=True,
-        )
-        return (result.stdout.strip() or mode)
+        try:
+            result = subprocess.run(
+                ["osascript", "-", cwd, sid],
+                input=_APPLESCRIPTS[(target, mode)],
+                text=True, capture_output=True, check=True,
+            )
+            return (result.stdout.strip() or mode)
+        except subprocess.CalledProcessError as e:
+            print(f"Error running AppleScript: {e}", file=sys.stderr)
+            print(f"AppleScript stderr: {e.stderr}", file=sys.stderr)
+            raise
     raise ValueError(f"unknown target: {target}")
 
 
@@ -172,11 +177,15 @@ on run argv
   set theCwd to item 1 of argv
   set theSid to item 2 of argv
   set cmd to "cd " & quoted form of theCwd & " && claude --resume " & theSid
-  tell application "Terminal" to activate
-  delay 0.1
-  set wasOpen to ((count of windows) > 0)
-  set tabsBefore to 0
-  if wasOpen then set tabsBefore to count of tabs of front window
+  
+  tell application "Terminal"
+    activate
+    delay 0.1
+    set wasOpen to ((count of windows) > 0)
+    set tabsBefore to 0
+    if wasOpen then set tabsBefore to count of tabs of front window
+  end tell
+  
   set kbErr to false
   try
     tell application "System Events"
@@ -188,17 +197,21 @@ on run argv
   on error
     set kbErr to true
   end try
+  
   set newTabOk to false
-  if not kbErr and ((count of windows) > 0) then
-    if (count of tabs of front window) > tabsBefore then set newTabOk to true
-  end if
-  if newTabOk then
-    tell application "Terminal" to do script cmd in selected tab of front window
-    return "tab"
-  else
-    tell application "Terminal" to do script cmd
-    return "window-fallback"
-  end if
+  tell application "Terminal"
+    if not kbErr and ((count of windows) > 0) then
+      if (count of tabs of front window) > tabsBefore then set newTabOk to true
+    end if
+    
+    if newTabOk then
+      do script cmd in selected tab of front window
+      return "tab"
+    else
+      do script cmd
+      return "window-fallback"
+    end if
+  end tell
 end run
 """,
     ("terminal", "window"): """\
