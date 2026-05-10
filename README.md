@@ -2,10 +2,12 @@
 
 Snapshot, list, and restore [Claude Code](https://docs.claude.com/en/docs/claude-code) CLI sessions across terminal tabs. *Built with Claude Code itself.*
 
+🌐 **[Visit the Website](https://claude-tabs.builditwithai.xyz)**
+
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/surendranb/claude-tabs/main/install.sh | sh
+curl -fsSL https://claude-tabs.builditwithai.xyz/install | sh
 ```
 
 Picks a writable directory on your `$PATH` automatically. Falls back to `~/.local/bin` (no sudo) or `/usr/local/bin` (with sudo). Single Python 3 file, stdlib only.

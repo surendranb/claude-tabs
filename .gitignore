@@ -1,0 +1,12 @@
+# Ignore website and Cloudflare files (keep repo clean)
+site/
+video/
+functions/
+wrangler.toml
+.wrangler/
+
+# Ignore node_modules and build outputs
+node_modules/
+out/
+dist/
+.DS_Store
